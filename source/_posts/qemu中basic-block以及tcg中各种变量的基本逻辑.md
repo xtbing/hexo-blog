@@ -1,0 +1,69 @@
+---
+title: qemu中basic block以及tcg中各种变量的基本逻辑
+tags:
+  - QEMU
+description: >-
+  在实现一个CPU架构的QEMU前端指令翻译的时候会用到各种tcg变量，本文整理这些
+  变量的基本语意，分析背后的qemu代码。本文分析基于的QEMU版本是6.2.0, 基于riscv  CPU体系结构。
+abbrlink: 5006
+date: 2023-02-19 16:25:45
+categories:
+---
+
+指令前端翻译
+------------
+
+ QEMU的前端翻译使用中间码实现guest指令的逻辑，中间码其实已经是一组完备的类RISC
+ 汇编指令定义。我们做前端翻译，可以理解为使用中间码作为汇编语言实现guest指令的逻辑。
+ QEMU代码qemu/tcg/README有怎么使用中间码的完整描述，值得仔细学习下。
+
+ 中间码的定义里有各种指令，还有不同作用域的“寄存器”的定义。我们关注的是各种“寄存器”，
+ 也就是tcg变量的定义。
+
+ QEMU翻译基于TB，一个TB里又可能有多个basic block，我们叫BB，tcg变量的作用域和BB
+ 有关系。tcg有三种类型的变量：temporary, local temporary和global，global这个不用
+ 多说，一般系统寄存器是global变量，temporary变量的生命只在一个BB内，local temporary
+ 变量的生命在一个TB内，可以跨越BB。
+
+ BB从上一个BB的结尾或者一个set_label指令开始, BB以分支指令(brcond_xxx)、goto_tb
+ 以及exit_tb结束，
+
+ 举一个arm里的例子：target/arm/translate.c
+```
+ static bool trans_LE
+        [...]
+        TCGv_i32 decr = tcg_temp_local_new_i32();                               
+        TCGv_i32 ltpsize = load_cpu_field(v7m.ltpsize);                         
+        tcg_gen_sub_i32(decr, tcg_constant_i32(4), ltpsize);                    
+        tcg_gen_shl_i32(decr, tcg_constant_i32(1), decr);                       
+        tcg_temp_free_i32(ltpsize);                                             
+                                                                                
+        tcg_gen_brcond_i32(TCG_COND_LEU, cpu_R[14], decr, loopend);             
+                                                                                
+        tcg_gen_sub_i32(cpu_R[14], cpu_R[14], decr);                            
+        tcg_temp_free_i32(decr);                                                
+        [...]
+```
+ 这里的decr就要是一个local temporary，因为这个变量在brcon_i32的前后都要使用，已经
+ 跨越了两个BB，这里的decr换成temporary变量就会出错。
+
+ global变量又分为寄存器和memory两类。memory一般定义的是CPU里的寄存器，比如riscv
+ 里是这样定义pc寄存器：
+```
+ cpu_pc = tcg_global_mem_new(cpu_env, offsetof(CPURISCVState, pc), "pc");    
+```
+ 这种TCGv在后端翻译时，会把guest CPU寄存器的值先load到host寄存器里，计算完后再store
+ 回guest CPU结构体里，模拟过程会有访存行为。
+
+ 寄存器这种TCGv在后端翻译时，会直接映射到host的寄存器上，每次就可以直接访问，一般
+ 用来存放guest CPU env的指针，比如riscv上env变量是这么定义的：
+```
+ /* tcg/tcg.c */
+ tcg_context_init(unsigned max_cpus)                                 
+   +-> tcg_global_reg_new_internal(s, TCG_TYPE_PTR, TCG_AREG0, "env");        
+```
+
+QEMU代码分析
+------------
+
+ 代码分析需要涉及tcg后端翻译，具体代码分析可以参考[这里](https://wangzhou.github.io/qemu-tcg中间码优化和后端翻译/)。

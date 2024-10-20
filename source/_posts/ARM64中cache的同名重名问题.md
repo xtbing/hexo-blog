@@ -1,0 +1,92 @@
+---
+title: ARM64中cache的同名重名问题
+tags:
+  - 计算机体系结构
+  - ARM64
+  - cache
+description: 本文回顾了虚拟地址索引cache中存在同名和重名问题。查看了ARM64下cache的实现 限制，并基于这些限制分析了可能的同名和重名等问题。
+abbrlink: 44215
+date: 2024-01-15 20:26:28
+categories:
+---
+
+aliasing和homonyms的基本逻辑
+------------------------------
+
+cache的基本概念在[这里](https://wangzhou.github.io/CPU中cache和MMU的基本逻辑/)有介绍，其中提到了在VIPT cache情况下遇到的问题。具体会遇到
+重名(aliasing)和同名(homonyms)的问题。中文的名字看的很晕，从英文名字就看的很清楚。
+
+重名(aliasing)，就是一个物理数据，因为被虚拟地址做cache索引，映射到了两个不同的
+cacheline上。这里遇到的核心问题是不同虚拟地址可能被map到了相同的物理地址上，所以
+在不同核上，使用虚拟地址做索引的cache就变成了两个独立的cache，需要增加新的逻辑
+来进行两者的同步。
+```
+ va1:                    va2:
+ +----------+            +-----------+
+ | cache1   |            | cache2    |
+ +----------+            +-----------+
+            \            /
+             \          /
+             +----------+
+             | memory   |
+             +----------+
+```
+VIPT cache上重名(aliasing)问题的解决思路是把virtual index塞到页偏移的低位，这样
+虽然是VIPT cache，但是已经等价于PIPT cache了。这种方法，在当cache比较大，way数小
+的时候，还是可能出现重名问题。
+
+同名(homonyms)，homonyms是同音异意词的意思，简单讲就是不同进程虚拟地址相同，但是
+map的物理地址是不同的，使用虚拟地址做cache索引时，相同的虚拟地址应该指向不同的
+数据，如果物理tag又相同，这里就会有问题。
+
+我们具体看下同名问题出问题的情况。比如，VIPT cache:
+```
+   va1 -> pa1
+   va2 -> pa2
+```
+两组映射的index，tag相同，当第一个映射向第二个映射转换时，没有刷cache，问题就会
+出现。释放内存时就可能出现，比如释放va1->pa1，申请的时候完全可以再次给你va1->pa1，
+之前的cache还在一定会出错。做进程切换的时候，也可能错，在第二个进程上，一样的va
+可能映射给不同的pa，这个时候index是一样的，只要映射pa的tag和之前的一样，cpu访问
+va就可能使用之前的cache。
+
+如果我们使用PIPT cache，上面的两个问题没有了。我们考虑还有没有其它问题存在。在
+一个硬件保证cache一致性的系统，PIPT cache基本上对软件是透明的。有的情况下可能硬
+件保证不了CPU和外设之间的cache一致性，这个时候就需要软件使用cache维护指令维护
+cache一致性。
+
+页表存放在内存里，所以它也可能缓存在cache里。PTW作为一个master和其它master，包括，
+其它PTW master、访存master和取指令master在cache有一定的逻辑关系，这个和具体体系
+结构有关系，我们放到下面ARM64的部分具体分析。
+
+ARM64中cache的逻辑
+-------------------
+
+ARM手册(J.a版本)对cache的实现有如下定义(D8.15)：
+
+Data和unified cache要实现成PIPT的cache，这里unified cache就是指数据和指令都存的
+cache，一般是L2 cache。
+
+L1指令cache可以实现为PIPT/VPIPT(VMID-aware)/VIPT其中的一种，通过CTR_EL0.L1Ip这个
+域段提示给软件。指令cache只能通过指令fetch填充，指令cache不能写，只能对指令cache
+做invalidation。ARM spec里对L1指令cache里出现的aliasing问题的兜底解决方案是清掉
+所有的指令cache。
+
+基于以上的定义，我们重新看看上面的问题是否存在，因为只有L1指令cache有可能通过VA
+索引，所以只需要关注L1指令cache的情况。
+
+对于同名问题，可以在进程切换的时候，做L1icache清理。感觉这个只要清理L1 icache就好，
+看起来IC IALLU可以完成整个功能(invalidate all (to) PoU)， 这个PoU同步点一般就是L2
+cache。
+
+对于重名问题，现在的问题定义是，一段指令，可能被缓存到了不同VA索引的不同核的L1
+icache上。如果只是fetch指令执行，也不会出问题，唯一可能出问题的代码本身修改了。
+在这种情况下，自修改代码的逻辑除了要无效化本核上的icache，也要无效化可能和这个核
+共享代码的其它核上的icache。看起来ARM上的IC IALLUIS可以完成这个功能(invalidate all
+(to) PoU (in) inner shareble)。
+
+ARM上其它的cache都只能是PIPT cache，如上第一节中的分析，一般情况下，这些cache对
+软件都是透明的了。现代的SoC系统上，外设和CPU基本上也可以做到硬件维护cache一致性。
+
+TODO: PTW和cache之间的关系。
+

@@ -1,0 +1,227 @@
+---
+title: Linux内核调度中负载的计算
+abbrlink: 43549
+date: 2024-03-14 14:35:07
+tags: [Linux内核, 调度]
+description: "本文总结Linux内核中调度子系统内负载计算的基本逻辑。分析依赖的内核版本是v6.8-rc5。"
+categories:
+---
+
+基本逻辑
+---------
+
+首先看下CPU利用率以及权重的定义。CPU利用率描述的对象是CPU，task只要放到CPU上跑就
+要占用一定的CPU资源，没有task跑的时候CPU就是空闲的，所以CPU利用率在0到100%之间。
+权重是线程优先级折算出的一个系数。
+
+CPU负载指的是CPU上运行task的情况，内核不断的调度不同的task到CPU上运行，那我们怎
+么度量CPU上的负载。负载度量的是CPU上需要运行的task的量，一般逻辑上，内核里用加入
+rq里的时间和task存在的总时间的比值做负载的度量：
+```
+     task加入rq里的时间(runnable)
+    ------------------------------ x 1024
+       task存在的时间(periods)
+```
+可以看到对于一个计算密集性的task，这个比值是接近1的，为了避免小数，把这个比值乘
+以1024，最终这个值是接近1024的。当一个core上有多个计算密集性的task时，负载接近
+task的个数乘以1024。需要注意的是，这种基于每个调度实体的负载计算方法是在v3.8的内
+核版本引入的，名字叫per-entity load tracking(PELT)。需要注意的时候，本文中在不讨
+论具体度量值含义时，一般笼统的叫各种度量值为“负载”，在具体讨论度量值的含义时会再
+做具体的解释。
+
+Linux内核在计算一个task或者一个调度实体的负载时，考虑了过去一段时间的负载对未来
+的可能影响。直观上看，内核计算本时刻的负载，是为了调度服务，如果本时刻的负载很高，
+调度器把task安排到合适的core上执行，下个时刻负载变的很低，这种安排就是不合理的，
+所以，考虑过去一段时间的负载，是为了通过过去负载数据，得到这个调度实体的负载基本
+情况。
+
+具体上看，内核把负载的统计时间段(period)设定为1024us(大概是1ms，1024是为了方便计
+算)，调度实体某个时间的负载定义，是过去各个时间段的负载和一个逐渐减小的衰减系数
+乘积之和：
+```
+ load_sum = v0 + v1 * y^1 + v2 * y^2 + ... vn * y^n, 其中定义y^32 ~= 0.5。
+```
+在一个period内，如果调度实体一直在rq，那么对应的vn值就是1024。如上这个等比数列有
+最大值存在，内核里对这个值的定义是：#define LOAD_AVG_MAX 47742。
+
+我们可以写个demo的死循环程序，运行一段时间后观察对应task的load_sum的值。可以看到
+如下的se.avg.load_sum的值比较接近最大值。从内核的计算代码上看，runnable_sum每次
+计算会乘上1024，util_sum也会每次计算会乘上1024，但是util_sum只在task在CPU上运行
+时计算。
+```
+# cat /proc/120/sched
+a.out (120, #threads: 1)
+-------------------------------------------------------------------
+se.exec_start                                :        115459.735792
+se.vruntime                                  :         81051.015808
+se.sum_exec_runtime                          :         80699.256128
+se.nr_migrations                             :                    0
+nr_switches                                  :                  603
+nr_voluntary_switches                        :                   43
+nr_involuntary_switches                      :                  560
+se.load.weight                               :              1048576
+se.avg.load_sum                              :                47719  <---
+se.avg.runnable_sum                          :             48870356
+se.avg.util_sum                              :             44864269
+se.avg.load_avg                              :                 1023
+se.avg.runnable_avg                          :                 1023
+se.avg.util_avg                              :                  940
+se.avg.last_update_time                      :         115459735552
+se.avg.util_est                              :                  664
+policy                                       :                    0
+prio                                         :                  120
+clock-delta                                  :                  672
+mm->numa_scan_seq                            :                    0
+numa_pages_migrated                          :                    0
+numa_preferred_nid                           :                   -1
+total_numa_faults                            :                    0
+current_node=0, numa_group_id=0
+numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0
+```
+todo: load_avg/runnable_avg/util_avg的计算没有看懂。
+
+代码分析
+---------
+
+负载相关的数据结构为struct sched_avg，调度实体中会内嵌一个sched_avg。如下struct
+load_weight指的是权重，不是各种负载的统计，struct sched_avg中各个域段才是负载的
+描述。
+```
+struct sched_entity {
+
+  struct load_weight load;
+    +-> weight
+    +-> inv_weight
+
+  struct sched_avg avg;
+    +-> load_sum
+    +-> runnable_sum
+    +-> util_sum
+    +-> load_avg
+    +-> runnable_avg
+    +-> util_avg
+}
+```
+
+负载相关的更新点有很多，但是，最终都会调用到update_load_avg。
+```
+/* linux/kernel/sched/fair.c */
+update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+  +-> __update_load_avg_se(now, cfs_rq, se)
+
+    /*
+     * 计算调度实体的load_sum/runnable_sum/util_sum，xxx_sum就是上面提到的各个
+     * period时间段加权统计量的和。xxx_sum的计算使用了一些技巧，我们把其中的逻辑
+     * 单独抽出来分析。
+     */
+    if (___update_load_sum(now, &se->avg, !!se->on_rq, se_runnable(se),
+                            cfs_rq->curr == se)) {
+
+       /* 计算各个平均量, load_avg计算中乘的load是这个se的权重 */
+       ___update_load_avg(&se->avg, se_weight(se));
+
+            /*
+             * 除数为：PELT_MIN_DIVIDE + avg->period_contrib，即：
+             *         LOAD_AVG_MAX*y + avg->period_contrib
+             *
+             * avg->period_contrib的含义是上面计算xxx_sum时，对于1024us的时间段，
+             * 多余出来的时间。
+             *                           inf                  inf
+             * LOAD_AVG_MAX * y = ( 1024 Sum y^n ) * y = 1024 Sum y^n
+             *                           n=0                  n=1
+             *
+             * 所以，LOAD_AVG_MAX*y + avg->period_contrib为：
+             *
+             *      inf    
+             * 1024 Sum y^n + avg->period_contrib，是这个时间点sum的理论最大值。
+             *      n=1    
+             *
+             * 总结下，对于一个计算很密集的se(或task)，load_avg会近似为它的权重，
+             * runnable_avg会近似为1024(1 << SCHED_CAPACITY_SHIFT)，util_avg?
+             *
+             */
+         +-> sa->load_avg = div_u64(load * sa->load_sum, divider);
+         +-> sa->runnable_avg = div_u64(sa->runnable_sum, divider);
+         +-> WRITE_ONCE(sa->util_avg, sa->util_sum / divider);
+
+       cfs_se_util_change(&se->avg);
+    }
+
+      /*
+       * 计算一个cfs_rq的各种负载统计，应该是rq上各个se的负载相加。在把一个se加
+       * 入rq时，会把se的负载统计加入rq的负载统计，代码路径在：(以CFS为例)
+       * sched_class->switched_to_fair->attach_task_cfs_rq->attach_entity_cfs_rq
+       * ->attach_entity_load_avg。
+       *
+       * 注意这里把cfs_rq->avg里的负载统计，也和entity->avg一样，使用衰减系数加
+       * 权处理了下。但是，在计算sum值时，传入的参数不一样，load为
+       * scale_load_down(cfs_rq->load.weight)，runnable是rq上的线程数，running是
+       * 是否为CPU上正在运行的线程。
+       *
+       * 使用衰减系数加权的办法得到一个动态变化量的描述，cfs_rq的负载也这样计算
+       * 是没有问题的，需要注释的是为什么同样一套逻辑可以既处理se的负载又可以处
+       * 理cfs_rq的负载。
+       */
+  +-> decayed  = update_cfs_rq_load_avg(now, cfs_rq);
+    +-> decayed |= __update_load_avg_cfs_rq(now, cfs_rq);
+
+      /* 没有搞懂这里的逻辑？*/
+  +-> decayed |= propagate_entity_load_avg(se);
+
+      /*
+       * 如果是se挂入rq的情况, 并且是挂入一个新的CPU，可以看到se相关的负载统计
+       * 也一并加到rq的负载统计里。
+       */
+  +-> if (!se->avg.last_update_time && (flags & DO_ATTACH)) {
+
+        attach_entity_load_avg(cfs_rq, se);
+        update_tg_load_avg(cfs_rq);
+
+  +-> } else if (flags & DO_DETACH) {
+
+        detach_entity_load_avg(cfs_rq, se);
+        update_tg_load_avg(cfs_rq);
+
+  +-> } else if (decayed) {
+
+        cfs_rq_util_change(cfs_rq, 0);
+          +-> cpufreq_update_util
+
+        if (flags & UPDATE_TG)
+          update_tg_load_avg(cfs_rq);
+      }
+```
+
+___update_load_sum细节逻辑展开如下。我们的目的是计算如上load_sum的值，计算load_sum
+的值其实不必要知道过去每个1024us域段对应的vn值，我们直接借助内核代码里的注释说明
+问题。
+```
+  period_contrib  d1          d2           d3                                        
+              ^   ^           ^            ^                                         
+              |   |           |            |                                         
+            |<->|<->|<----------------->|<--->|                                      
+        ... |---x---|------| ... |------|-----x (now)                                
+                ^     n=p-1        n = 1      ^
+                |                             |
+       
+          上次更新时间点                本次更新时间点
+```
+本次更新时间点负载的定义以及推导如下，p_c是上面period_contrib的简称。
+```
+load_sum = v0 + v1 * y^1 + v2 * y^2 + ... vn * y^n ...
+         
+         = d3 + 1024 * y^1 + 1024 * y^2 + ... 1024 * y^(p - 1) + (d1 + p_c) * y^p + ...
+
+                     p-1
+         = d3 + 1024 Sum* y^n +  (d1 + p_c) * y^p + ...
+                     n=1
+                     p-1
+         = d3 + 1024 Sum* y^n +  d1 * y^p + p_c * y^p + 1024 *y^(p + 1) + ...
+                     n=1
+                     p-1
+         = d3 + 1024 Sum* y^n +  d1 * y^p + (p_c + 1024 * y^1 + 1024 * y^2 + ...)
+                     n=1                    |<-- 就是上次更新时间点负载的定义-->|
+```                                             
+如上的结果就是内核accumulate_sum函数的注释中一开始的公式。需要注意的是d2域段的系
+数为什么都是1024，参考本文一开始的负载计算的逻辑，只要d2这段时间，se都在rq里，那
+么rq时间和每一段的时间相等，比值就只剩下1024了。

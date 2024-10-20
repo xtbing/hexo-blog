@@ -1,0 +1,144 @@
+---
+title: riscv中断异常委托关系分析
+tags:
+  - riscv
+description: 本文分析riscv构架下，中断和异常在各个特权级下的委托关系。
+abbrlink: 9859
+date: 2022-10-19 16:15:21
+categories:
+---
+
+基本逻辑
+--------
+
+ 在H扩展使能的情况下，我们要考虑M/HS/VS这三种模式下的中断异常委托关系。其中，medeleg/mideleg
+ 把中断异常委托到HS处理，hedeleg/hideleg把中断异常委托到VS处理。
+
+ medeleg/mideleg在opensbi里配置，代码在：opensbi/lib/sbi/sbi_hart.c: delegate_traps
+
+ hedeleg/hideleg在内核的KVM代码里配置，路径是：linux/arch/riscv/kvm/main.c: kvm_arch_hardware_enable
+ 在vcpu start的时候，会调用如上函数，配置hedeleg/hideleg，在vcpu disable的时候，
+ 把hedeleg/hideleg清0。
+ 
+medeleg/mideleg的逻辑
+---------------------
+
+ 如果没有S mode，没有必要做委托相关的配置了，直接返回。如果S mode存在，S mode的
+ 几种中断被委托到S mode:
+```
+   MIP_SSIP
+   MIP_STIP
+   MIP_SEIP
+   MIP_LCOFIP (如果支持PMU中断)
+```
+ opensbi把如下异常委托到S mode处理: 
+```
+   MISALIGNED_FETCH
+   BREAKPOINT
+   USER_ECALL
+   FETCH_PAGE_FAULT
+   LOAD_PAGE_FAULT
+   STORE_PAGE_FAULT
+```
+ 上面是没有H扩展的情况，如果平台支持H扩展，再把如下的异常委托到S mode处理:
+```
+   VIRTUAL_SUPERVISOR_ECALL
+   FETCH_GUEST_PAGE_FAULT
+   LOAD_GUEST_PAGE_FAULT
+   VIRTUAL_INST_FAULT
+   STORE_GUEST_PAGE_FAULT
+```
+ 为了方便描述，我们把上面第一组异常叫做A组，把上面第二组异常叫做B组。
+
+ 在没有H扩展的时候，把A组异常委托到S mode已经满足需求。
+
+ 我们考虑有H扩展的场景，这个时候又分虚拟化被使用和没有被使用的情况，没有使用虚拟化
+ 和没有H扩展的场景是一样的，无非是B组异常被委托到S mode，但是没有使用而已。
+
+ 在使用虚拟机的场景，虚拟机拉起之前，会进一步把A组异常委托到虚拟机的S mode，就是VS，
+ 这组异常在VS里处理，不必退出虚拟机。
+
+ 在使用虚拟机的场景里，B组异常的委托关系不变，依然在host S mode处理，就是HS。
+ 可以看出，B组异常都是CPU运行在VU/VS时的异常，而且在虚拟机里已经处理不了这些异常，
+ 比如，第二级地址翻译相关的异常以及从VS发起的ECALL，VS已经hold不住这些异常，这些
+ 异常需要在hypvisor里处理。比如，在只有host的情况，没有错误的情况下，访问一个物理
+ 地址是一定会成功的，但是，在虚拟机的内核里，访问虚拟机物理地址(IPA)的时候还要通过
+ IPA到PA的地址翻译，如果没有分配PA，就会陷入HS的缺页异常里处理缺页，同时VS模式下
+ 也可以发出ECALL，这个ECALL需要到HS下去处理。
+
+ 退出虚拟机会停止委托A组异常到VS，这时系统进入有H扩展但是没有使用虚拟机的场景，
+ 因为之前A组异常已经被委托到HS，这时系统也是可以正常工作的。
+
+hedeleg/hideleg的逻辑
+---------------------
+
+ vcpu开始运行之前，把如下异常和中断委托到VS模式下处理, vcpu退出运行的时候，需要把
+ hedeleg/hideleg清空，这个动作在：linux/arch/riscv/kvm/main.c: kvm_arch_hardware_disable。
+
+ 这个逻辑是很自然的，上面M mode下已经把需要在S mode处理的中断和异常委托在S mode下
+ 处理，如果没有H扩展，这些异常和中断就在host的内核态处理，如果有H扩展，那么在内核
+ KVM启动vcpu之前，继续把这些异常和中断委托到VS，这样CPU在运行虚拟机代码时，如果发生
+ 如下的异常和中断，就会使用VS模式定义的那些异常中断上下文寄存器在VS模式下处理这些
+ 异常和中断，当虚拟机退出时，把到VS模式的这些委托去掉，再发生这样的异常和中断，就
+ 在HS模式下处理。
+```
+   INST_MISALIGNED
+   BREAKPOINT
+   SYSCALL
+   INST_PAGE_FAULT
+   LOAD_PAGE_FAULT
+   STORE_PAGE_FAULT
+   
+   VS_SOFT
+   VS_TIMER
+   VS_EXT
+```
+ 可以看到，如上的异常就是上面说的A组异常。
+
+ 我们可以从具体一个异常的角度再看看，比如一个user mode ECALL异常，当没有H扩展时，
+ 异常的处理使用S mode的那组CSR寄存器，当有H扩展时，在虚拟机里，用户态触发的ECALL
+ 在VS模式处理，使用VS模式的那组寄存器，VS模式CSR寄存器在vcpu启动之前已经都切到S
+ mode的CSR寄存器上，所以，直接使用S mode的寄存器就好。
+
+M mode处理的异常和中断
+----------------------
+
+ 除了如上委托到VS/HS模式的异常中断，其他没有委托的都要在M模式处理。我们把opensbi
+ 上定义的异常和中断类似都列出来，一个一个具体看下，如下用“<---”标注的异常或者中断
+ 是在M mode处理的。可以看到在M mode处理的异常，要不就是没法挽救的异常，要不就是本来
+ 就应该在M mode处理的异常。
+```
+MISALIGNED_FETCH	0x0
+FETCH_ACCESS		0x1      <--- 取指令异常，没有对齐
+ILLEGAL_INSTRUCTION	0x2	 <--- 非法指令异常
+BREAKPOINT		0x3
+MISALIGNED_LOAD		0x4      <--- 读地址不对齐
+LOAD_ACCESS		0x5      <--- PMP读异常
+MISALIGNED_STORE	0x6      <--- 写地址不对齐
+STORE_ACCESS		0x7      <--- PMP写异常
+USER_ECALL		0x8
+SUPERVISOR_ECALL	0x9      <--- S mode ECALL异常
+VIRTUAL_SUPERVISOR_ECALL0xa
+MACHINE_ECALL		0xb      <--- M mode ECALL异常
+FETCH_PAGE_FAULT	0xc
+LOAD_PAGE_FAULT		0xd
+STORE_PAGE_FAULT	0xf
+FETCH_GUEST_PAGE_FAULT	0x14
+LOAD_GUEST_PAGE_FAULT	0x15
+VIRTUAL_INST_FAULT	0x16
+STORE_GUEST_PAGE_FAULT	0x17
+
+IRQ_S_SOFT			1
+IRQ_VS_SOFT			2
+IRQ_M_SOFT			3   <---
+IRQ_S_TIMER			5
+IRQ_VS_TIMER			6
+IRQ_M_TIMER			7   <---
+IRQ_S_EXT			9
+IRQ_VS_EXT			10
+IRQ_M_EXT			11  <---
+IRQ_S_GEXT			12
+IRQ_PMU_OVF			13
+```
+ 需要特殊说明的是，上面的中断中的IRQ_VS_EXT, IRQ_VS_TIMER, IRQ_VS_SOFT在H扩展存在
+ 时，直接被硬件代理到HS，IRQ_S_GEXT在H扩展存在且GEILEN非0时同样被硬件代理到HS。
